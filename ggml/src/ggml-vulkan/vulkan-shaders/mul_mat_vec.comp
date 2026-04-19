@@ -7,7 +7,13 @@
 
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
-#if !defined(DATA_A_F32) && !defined(DATA_A_F16) && !defined(DATA_A_BF16)
+#if defined(Q4_0_SOA_K64)
+#define K_PER_ITER 64
+#elif defined(Q4_0_SOA)
+// Process one full 32-elem Q4_0 block per iter: amortizes the single fp16 scale
+// read across 4 u32 qs loads and 8 vec4 B loads per row.
+#define K_PER_ITER 32
+#elif !defined(DATA_A_F32) && !defined(DATA_A_F16) && !defined(DATA_A_BF16)
 #define K_PER_ITER 8
 #else
 #define K_PER_ITER 2
@@ -23,7 +29,83 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
         const uint iqs = (col%QUANT_K)/QUANT_R; // quant index
         const uint iybs = col - col%QUANT_K; // y block start index
 
-#if K_PER_ITER == 8
+#if K_PER_ITER == 64
+        // SoA Q4_0 fast path: two blocks (64 elements) per iter. Amortizes
+        // loop overhead further and keeps more loads in flight.
+        const uint bbase = (j*p.batch_stride_b + b_offset + iybs) / 4;
+        vec4 bv_lo[4], bv_hi[4], bv_lo2[4], bv_hi2[4];
+        [[unroll]] for (uint w = 0; w < 4; ++w) {
+            bv_lo[w]  = vec4(data_b_v4[bbase + w]);
+            bv_hi[w]  = vec4(data_b_v4[bbase + 4 + w]);
+            bv_lo2[w] = vec4(data_b_v4[bbase + 8 + w]);
+            bv_hi2[w] = vec4(data_b_v4[bbase + 12 + w]);
+        }
+        uint ibi = first_row*p.ncols;
+        [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+            const uint ib = (ibi + col)/QUANT_K;
+            ibi += p.ncols;
+            const float d0 = float(data_a_ws[a_offset + ib]);
+            const float d1 = float(data_a_ws[a_offset + ib + 1]);
+            FLOAT_TYPE acc0 = FLOAT_TYPE(0);
+            FLOAT_TYPE acc1 = FLOAT_TYPE(0);
+            [[unroll]] for (uint w = 0; w < 4; ++w) {
+                const uint w32a = data_a_wq32[(a_offset + ib) * 4u + w];
+                const uint w32b = data_a_wq32[(a_offset + ib + 1) * 4u + w];
+                const uint a0 = (w32a       ) & 0xFFu;
+                const uint a1 = (w32a >>  8u) & 0xFFu;
+                const uint a2 = (w32a >> 16u) & 0xFFu;
+                const uint a3 = (w32a >> 24u) & 0xFFu;
+                const vec4 vlo = vec4(int(a0 & 0xFu) - 8, int(a1 & 0xFu) - 8,
+                                      int(a2 & 0xFu) - 8, int(a3 & 0xFu) - 8);
+                const vec4 vhi = vec4(int(a0 >> 4) - 8,   int(a1 >> 4) - 8,
+                                      int(a2 >> 4) - 8,   int(a3 >> 4) - 8);
+                const uint c0 = (w32b       ) & 0xFFu;
+                const uint c1 = (w32b >>  8u) & 0xFFu;
+                const uint c2 = (w32b >> 16u) & 0xFFu;
+                const uint c3 = (w32b >> 24u) & 0xFFu;
+                const vec4 vlo2 = vec4(int(c0 & 0xFu) - 8, int(c1 & 0xFu) - 8,
+                                       int(c2 & 0xFu) - 8, int(c3 & 0xFu) - 8);
+                const vec4 vhi2 = vec4(int(c0 >> 4) - 8,   int(c1 >> 4) - 8,
+                                       int(c2 >> 4) - 8,   int(c3 >> 4) - 8);
+                acc0 += dot(bv_lo[w],  vlo);
+                acc0 += dot(bv_hi[w],  vhi);
+                acc1 += dot(bv_lo2[w], vlo2);
+                acc1 += dot(bv_hi2[w], vhi2);
+            }
+            temp[j][n] += acc0 * d0 + acc1 * d1;
+        }
+#elif K_PER_ITER == 32
+        // SoA Q4_0 fast path: one block (32 elements) per iter.
+        // QUANT_R=2 — pairs of elements straddle the low/high nibble of each byte,
+        // so B[iybs..iybs+15] pairs with low nibbles and B[iybs+16..iybs+31] with high.
+        const uint bbase = (j*p.batch_stride_b + b_offset + iybs) / 4;
+        vec4 bv_lo[4], bv_hi[4];
+        [[unroll]] for (uint w = 0; w < 4; ++w) {
+            bv_lo[w] = vec4(data_b_v4[bbase + w]);
+            bv_hi[w] = vec4(data_b_v4[bbase + 4 + w]);
+        }
+        uint ibi = first_row*p.ncols;
+        [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+            const uint ib = (ibi + col)/QUANT_K;
+            ibi += p.ncols;
+            const float d = float(data_a_ws[a_offset + ib]);
+            FLOAT_TYPE acc = FLOAT_TYPE(0);
+            [[unroll]] for (uint w = 0; w < 4; ++w) {
+                const uint w32 = data_a_wq32[(a_offset + ib) * 4u + w];
+                const uint b0 = (w32       ) & 0xFFu;
+                const uint b1 = (w32 >>  8u) & 0xFFu;
+                const uint b2 = (w32 >> 16u) & 0xFFu;
+                const uint b3 = (w32 >> 24u) & 0xFFu;
+                const vec4 vlo = vec4(int(b0 & 0xFu) - 8, int(b1 & 0xFu) - 8,
+                                      int(b2 & 0xFu) - 8, int(b3 & 0xFu) - 8);
+                const vec4 vhi = vec4(int(b0 >> 4) - 8,   int(b1 >> 4) - 8,
+                                      int(b2 >> 4) - 8,   int(b3 >> 4) - 8);
+                acc += dot(bv_lo[w], vlo);
+                acc += dot(bv_hi[w], vhi);
+            }
+            temp[j][n] += acc * d;
+        }
+#elif K_PER_ITER == 8
 #if QUANT_R == 2
         const vec4 bv02 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + iybs + iqs) / 4]);
         const vec4 bv13 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + iybs + iqs + y_offset) / 4]);
@@ -33,26 +115,11 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
         const vec4 bv0 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + iybs + iqs) / 4]);
         const vec4 bv1 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + iybs + iqs) / 4 + 1]);
 #endif
-#else
-        // Check if the second of the pair of elements is OOB, and don't fetch B or
-        // accumulate it. We still fetch a pair of elements for A, which is fine for
-        // quantized formats since they'll be within the same block. We should
-        // probably skip fetching the second element for F16/F32, but as of now we
-        // still do.
-        const bool OOB = lastiter && (iybs + iqs + y_offset >= p.ncols);
-
-        FLOAT_TYPE b0 = 0, b1 = 0;
-        b0 = FLOAT_TYPE(data_b[j*p.batch_stride_b + b_offset + iybs + iqs]);
-        if (!OOB) {
-            b1 = FLOAT_TYPE(data_b[j*p.batch_stride_b + b_offset + iybs + iqs + y_offset]);
-        }
-#endif
         uint ibi = first_row*p.ncols;
         [[unroll]] for (uint n = 0; n < num_rows; ++n) {
             const uint ib = (ibi + col)/QUANT_K; // block index
             ibi += p.ncols;
 
-#if K_PER_ITER == 8
             vec4 v = dequantize4(ib, iqs, a_offset);
             vec4 v2 = dequantize4(ib, iqs+(4/QUANT_R), a_offset);
 
@@ -70,7 +137,25 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
                 rowtmp *= dm.x;
 
             temp[j][n] += rowtmp;
-#else
+        }
+#else  // K_PER_ITER == 2
+        // Check if the second of the pair of elements is OOB, and don't fetch B or
+        // accumulate it. We still fetch a pair of elements for A, which is fine for
+        // quantized formats since they'll be within the same block. We should
+        // probably skip fetching the second element for F16/F32, but as of now we
+        // still do.
+        const bool OOB = lastiter && (iybs + iqs + y_offset >= p.ncols);
+
+        FLOAT_TYPE b0 = 0, b1 = 0;
+        b0 = FLOAT_TYPE(data_b[j*p.batch_stride_b + b_offset + iybs + iqs]);
+        if (!OOB) {
+            b1 = FLOAT_TYPE(data_b[j*p.batch_stride_b + b_offset + iybs + iqs + y_offset]);
+        }
+        uint ibi = first_row*p.ncols;
+        [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+            const uint ib = (ibi + col)/QUANT_K; // block index
+            ibi += p.ncols;
+
             const vec2 v = dequantize(ib, iqs, a_offset);
 
             // matrix multiplication
@@ -78,8 +163,8 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
             if (!OOB) {
                 temp[j][n] = fma(FLOAT_TYPE(v.y), b1, temp[j][n]);
             }
-#endif
         }
+#endif
     }
 }
 
