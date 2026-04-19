@@ -1,0 +1,72 @@
+#version 450
+
+// Phase 3d: SoA Q4_0 dequant-to-fp16 fallback for prefill (and any other path that
+// currently routes through pipeline_dequant[Q4_0]). The input buffer is laid out as:
+//   bytes [0 .. M*K/2)          : WQ — packed nibbles, row-major (K/2 bytes per row)
+//   bytes [M*K/2 .. M*K/2+M*K/16): WS — fp16 scales, row-major (K/32 scales per row)
+// Output matches the stock dequant_q4_0 behavior: fp16 values in row-major order.
+//
+// Mirrors the stock dequant_q4_0 launch config (wg_denoms = {256*16, 1, 1}) and the
+// same 2-binding interface + 5-uint push layout, so the caller in ggml_vk_mul_mat_q_f16
+// can swap pipelines without changing dispatch code.
+
+#extension GL_EXT_control_flow_attributes                  : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16   : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32   : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage                     : require
+
+layout (push_constant) uniform parameter
+{
+    uint M;
+    uint K;
+    uint stride_a;
+    uint stride_b;
+    uint nel;
+} p;
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+// Binding 0 covers the entire SoA Q4_0 region: WQ followed by WS. Access WQ via uint32
+// loads (4 nibble bytes per uint32), and WS via uint32 loads + 16-bit halving.
+layout (binding = 0) readonly buffer A { uint32_t data_a32[]; };
+layout (binding = 1) writeonly buffer D { float16_t data_b[]; };
+
+void main() {
+    const uint i = gl_WorkGroupID.x * 4 + gl_LocalInvocationID.x / 64;
+
+    const uint tid = gl_LocalInvocationID.x % 64;
+    const uint il  = tid / 32;
+    const uint ir  = tid % 32;
+    const uint ib  = 32u * i + ir;               // q4_0 block index within the tensor
+    if (ib >= p.nel / 32u) {
+        return;
+    }
+
+    // Offsets within the SoA buffer, in uint32 units.
+    // WQ: M*K/2 bytes = M*K/8 uint32s. Each q4_0 block = 16 qs bytes = 4 uint32s.
+    // WS: M*K/32 fp16 scales = M*K/64 uint32s (2 scales per uint32).
+    const uint ws_base32 = (p.M * p.K) / 8u;
+
+    // Load the fp16 scale for block ib: element index = ib, packed 2 per uint32.
+    const uint ws_word = data_a32[ws_base32 + (ib / 2u)];
+    const uint ws_half = (ib & 1u) != 0u ? (ws_word >> 16) : (ws_word & 0xFFFFu);
+    const float d = float(uint16BitsToHalf(uint16_t(ws_half)));
+
+    // Load the qs[] for block ib: 4 uint32s at offset ib*4 in uint32 units.
+    const uint qs_base32 = ib * 4u;
+
+    const uint q_idx = 8u * il;             // byte offset in qs[] range [0,16)
+    const uint b_idx = 1024u * i + 32u * ir + q_idx;
+
+    // Pack 4 consecutive qs bytes per uint32. To read qs[q_idx + l] we need byte
+    // (q_idx + l) of the 16-byte qs block, which is at uint32 index ((q_idx + l) / 4)
+    // and byte lane ((q_idx + l) % 4).
+    [[unroll]] for (uint l = 0u; l < 8u; ++l) {
+        const uint bi       = q_idx + l;
+        const uint w        = data_a32[qs_base32 + (bi / 4u)];
+        const uint byte     = (w >> ((bi & 3u) * 8u)) & 0xFFu;
+        data_b[b_idx + l +  0] = float16_t(d * (float(int(byte &  0xFu)) - 8.0));
+        data_b[b_idx + l + 16] = float16_t(d * (float(int((byte >> 4) & 0xFu)) - 8.0));
+    }
+}

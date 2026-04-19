@@ -702,6 +702,26 @@ struct vk_device_struct {
     vk_pipeline pipeline_dequant_mul_mat_vec_f16_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
     vk_pipeline pipeline_dequant_mul_mat_vec_id_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT];
 
+    // Phase 3b: experimental SoA Q4_0 MMV pipeline (gated on GGML_VK_Q4_0_SOA env var).
+    // Separate field because the shader uses a distinct binding/push layout vs stock MMV.
+    vk_pipeline pipeline_dequant_mul_mat_vec_q4_0_soa_f32_f32;
+
+    // Phase 3d: experimental SoA Q4_0 dequant-to-fp16 pipeline (prefill fallback).
+    // Reads SoA layout [W_q | W_s] from a single vk_buffer and writes fp16 dequantized
+    // output. Gated on vk_q4_0_soa_enabled. Pipeline stays VK_NULL_HANDLE when flag is off.
+    vk_pipeline pipeline_dequant_q4_0_soa;
+
+    // Phase 3g (reworked): SoA Q4_0 matmul reusing stock mul_mm.comp with Q4_0_SOA defined.
+    // Same tile/warp/split-K selection as pipeline_dequant_mul_mat_mat[Q4_0], but with a
+    // 4th descriptor (WS fp16 scales at binding 3). Only populated when vk_q4_0_soa_enabled.
+    vk_matmul_pipeline2 pipeline_dequant_mul_mat_mat_q4_0_soa;
+
+    // Phase 3i: SoA Q4_0 MMQ variant reusing stock mul_mmq.comp with Q4_0_SOA defined.
+    // Uses hardware dotPacked4x8EXT integer-dot on Q4_0 weights against Q8_1-quantized B.
+    // 4th descriptor is WS fp16 scales at binding 3. Only populated when vk_q4_0_soa_enabled
+    // AND device->integer_dot_product.
+    vk_matmul_pipeline2 pipeline_dequant_mul_mat_mat_q4_0_soa_q8_1;
+
     vk_pipeline pipeline_dequant_mul_mat_vec_q8_1_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
     vk_pipeline pipeline_dequant_mul_mat_vec_id_q8_1_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT];
 
@@ -3240,8 +3260,23 @@ static uint32_t get_subgroup_size(const std::string &pipeline_name, const vk_dev
     return 0; // If no matching configuration is found
 }
 
+// Phase 3b: file-static flag for the experimental SoA Q4_0 MMV path. Set once on
+// first device init from env GGML_VK_Q4_0_SOA; non-null / non-"0" / non-"false" = on.
+static bool vk_q4_0_soa_enabled = false;
+static std::once_flag vk_q4_0_soa_enabled_flag;
+static void ggml_vk_init_q4_0_soa_flag() {
+    std::call_once(vk_q4_0_soa_enabled_flag, []() {
+        const char * v = getenv("GGML_VK_Q4_0_SOA");
+        vk_q4_0_soa_enabled = (v != nullptr) && strcmp(v, "0") != 0 && strcmp(v, "false") != 0;
+        GGML_LOG_INFO("ggml_vulkan: GGML_VK_Q4_0_SOA = %s (experimental SoA Q4_0 MMV path %s)\n",
+                      v ? v : "(unset)",
+                      vk_q4_0_soa_enabled ? "ENABLED" : "disabled");
+    });
+}
+
 static void ggml_vk_load_shaders(vk_device& device) {
     VK_LOG_DEBUG("ggml_vk_load_shaders(" << device->name << ")");
+    ggml_vk_init_q4_0_soa_flag();
 
     std::lock_guard<std::recursive_mutex> guard(device->mutex);
     // some shaders have a minimum subgroup size
@@ -3829,6 +3864,9 @@ static void ggml_vk_load_shaders(vk_device& device) {
 
         CREATE_MM2(GGML_TYPE_Q1_0, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q1_0], matmul_q1_0_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
         CREATE_MM2(GGML_TYPE_Q4_0, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q4_0], matmul_q4_0_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
+        if (vk_q4_0_soa_enabled) {
+            CREATE_MM2(GGML_TYPE_Q4_0, pipeline_dequant_mul_mat_mat_q4_0_soa, matmul_q4_0_soa_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 4, , 0);
+        }
         CREATE_MM2(GGML_TYPE_Q4_1, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q4_1], matmul_q4_1_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
         CREATE_MM2(GGML_TYPE_Q5_0, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q5_0], matmul_q5_0_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
         CREATE_MM2(GGML_TYPE_Q5_1, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q5_1], matmul_q5_1_f32, mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
@@ -3854,6 +3892,9 @@ static void ggml_vk_load_shaders(vk_device& device) {
 #if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
         if (device->integer_dot_product) {
             CREATE_MMQ(GGML_TYPE_Q4_0, pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_Q4_0], matmul_q4_0_q8_1, mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 3, , 0);
+            if (vk_q4_0_soa_enabled) {
+                CREATE_MMQ(GGML_TYPE_Q4_0, pipeline_dequant_mul_mat_mat_q4_0_soa_q8_1, matmul_q4_0_soa_q8_1, mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 4, , 0);
+            }
             CREATE_MMQ(GGML_TYPE_Q4_1, pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_Q4_1], matmul_q4_1_q8_1, mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 3, , 0);
             CREATE_MMQ(GGML_TYPE_Q5_0, pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_Q5_0], matmul_q5_0_q8_1, mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 3, , 0);
             CREATE_MMQ(GGML_TYPE_Q5_1, pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_Q5_1], matmul_q5_1_q8_1, mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 3, , 0);
@@ -3998,6 +4039,9 @@ static void ggml_vk_load_shaders(vk_device& device) {
 
         CREATE_MM(GGML_TYPE_Q1_0, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q1_0].f32acc, matmul_q1_0_f32, , mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
         CREATE_MM(GGML_TYPE_Q4_0, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q4_0].f32acc, matmul_q4_0_f32, , mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
+        if (vk_q4_0_soa_enabled) {
+            CREATE_MM(GGML_TYPE_Q4_0, pipeline_dequant_mul_mat_mat_q4_0_soa.f32acc, matmul_q4_0_soa_f32, , mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 4, , 0);
+        }
         CREATE_MM(GGML_TYPE_Q4_1, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q4_1].f32acc, matmul_q4_1_f32, , mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
         CREATE_MM(GGML_TYPE_Q5_0, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q5_0].f32acc, matmul_q5_0_f32, , mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
         CREATE_MM(GGML_TYPE_Q5_1, pipeline_dequant_mul_mat_mat[GGML_TYPE_Q5_1].f32acc, matmul_q5_1_f32, , mmq_wg_denoms, warptile_mmq, vk_mat_mat_push_constants, 3, , 0);
@@ -4023,6 +4067,9 @@ static void ggml_vk_load_shaders(vk_device& device) {
 #if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
         if (device->integer_dot_product) {
             CREATE_MMQ(GGML_TYPE_Q4_0, pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_Q4_0].f32acc, matmul_q4_0_q8_1, mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 3, );
+            if (vk_q4_0_soa_enabled) {
+                CREATE_MMQ(GGML_TYPE_Q4_0, pipeline_dequant_mul_mat_mat_q4_0_soa_q8_1.f32acc, matmul_q4_0_soa_q8_1, mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 4, );
+            }
             CREATE_MMQ(GGML_TYPE_Q4_1, pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_Q4_1].f32acc, matmul_q4_1_q8_1, mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 3, );
             CREATE_MMQ(GGML_TYPE_Q5_0, pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_Q5_0].f32acc, matmul_q5_0_q8_1, mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 3, );
             CREATE_MMQ(GGML_TYPE_Q5_1, pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_Q5_1].f32acc, matmul_q5_1_q8_1, mmq_wg_denoms, warptile_mmq_int, vk_mat_mat_push_constants, 3, );
@@ -4859,6 +4906,24 @@ static void ggml_vk_load_shaders(vk_device& device) {
         for (uint32_t i = 0; i < num_topk_moe_pipelines; ++i) {
             ggml_vk_create_pipeline2(device, device->pipeline_topk_moe[i][use_push], "topk_moe_f32_"+std::to_string(i), topk_moe_f32_len, topk_moe_f32_data, "main", 4, sizeof(vk_op_topk_moe_push_constants), {1, 1, 1}, {device->subgroup_size, 1u<<i, use_push}, 1, true, true, device->subgroup_size);
         }
+    }
+
+    // Phase 3b: experimental SoA Q4_0 MMV pipeline.
+    // Shader layout: 4 SSBOs (WQ u32, X f32, Y f32, WS f16), {M,K} push (8 bytes),
+    // hardcoded local_size_x=64, dispatch (M/8, 1, 1).
+    if (vk_q4_0_soa_enabled) {
+        ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q4_0_soa_f32_f32,
+                                "mul_mat_vec_q4_0_soa_f32_f32",
+                                mul_mat_vec_q4_0_soa_f32_f32_len, mul_mat_vec_q4_0_soa_f32_f32_data,
+                                "main", 4, 2 * sizeof(uint32_t), {8, 1, 1}, {}, 1);
+
+        // Phase 3d: SoA Q4_0 dequant-to-fp16 pipeline (prefill fallback). Mirrors stock
+        // dequant_q4_0's 2-binding + 5-uint push layout and wg_denoms so it can be swapped
+        // in by ggml_vk_get_to_fp16 without changing the dispatch site.
+        ggml_vk_create_pipeline(device, device->pipeline_dequant_q4_0_soa,
+                                "dequant_q4_0_soa",
+                                dequant_q4_0_soa_len, dequant_q4_0_soa_data,
+                                "main", 2, 5 * sizeof(uint32_t), {256 * 16, 1, 1}, {}, 1);
     }
 
     for (auto &c : compiles) {
@@ -6130,6 +6195,15 @@ static vk_pipeline ggml_vk_get_to_fp16(ggml_backend_vk_context * ctx, ggml_type 
             return nullptr;
     }
 
+    // Phase 3d: when the experimental SoA Q4_0 path is enabled, route Q4_0 dequant
+    // through the SoA-aware shader so prefill / any dequant-then-fp16-matmul path reads
+    // the repacked bytes correctly. Same 2-binding + 5-uint push interface as stock
+    // dequant_q4_0, so the caller is unchanged.
+    if (vk_q4_0_soa_enabled && type == GGML_TYPE_Q4_0 &&
+        ctx->device->pipeline_dequant_q4_0_soa != nullptr) {
+        return ctx->device->pipeline_dequant_q4_0_soa;
+    }
+
     return ctx->device->pipeline_dequant[type];
 }
 
@@ -7233,6 +7307,29 @@ static void ggml_vk_matmul(
     ctx->prealloc_split_k_need_sync = true;
 }
 
+// SoA Q4_0 variant: reuses the stock mul_mm tile machinery, adds the WS fp16 scales as a 4th binding.
+// WQ bytes live at a->offset .. a->offset+M*K/2; WS fp16 scales live immediately after at the same buffer.
+// Split-K path is intentionally unsupported here (caller must pass split_k==1) because the shader was
+// registered with parameter_count=4 and a split-K dispatch would need a different descriptor shape.
+static void ggml_vk_matmul_q4_0_soa(
+        ggml_backend_vk_context * ctx, vk_context& subctx, vk_pipeline& pipeline,
+        vk_subbuffer&& a, vk_subbuffer&& ws, vk_subbuffer&& b, vk_subbuffer&& d,
+        uint32_t m, uint32_t n, uint32_t k, uint32_t stride_a, uint32_t stride_b, uint32_t stride_d,
+        uint32_t batch_stride_a, uint32_t batch_stride_b, uint32_t batch_stride_d,
+        uint32_t batch, uint32_t ne02, uint32_t ne12, uint32_t broadcast2, uint32_t broadcast3,
+        uint32_t padded_n) {
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, CEIL_DIV(batch, ctx->device->properties.limits.maxComputeWorkGroupCount[2]));
+
+    uint32_t base_work_group_z = 0;
+    while (base_work_group_z < batch) {
+        uint32_t groups_z = std::min(batch - base_work_group_z, ctx->device->properties.limits.maxComputeWorkGroupCount[2]);
+
+        const vk_mat_mat_push_constants pc = { m, n, k, stride_a, stride_b, stride_d, batch_stride_a, batch_stride_b, batch_stride_d, base_work_group_z, batch, k, ne02, ne12, broadcast2, broadcast3, padded_n };
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a, b, d, ws }, pc, { m, n, groups_z });
+        base_work_group_z += groups_z;
+    }
+}
+
 static vk_pipeline ggml_vk_guess_matmul_id_pipeline(ggml_backend_vk_context * ctx, vk_matmul_pipeline& mmp, uint32_t m, uint32_t n, bool aligned, ggml_type src0_type) {
     VK_LOG_DEBUG("ggml_vk_guess_matmul_id_pipeline(" << m << ", " << n << ", " << aligned << ", " << ggml_type_name(src0_type) << ")");
 
@@ -7537,16 +7634,57 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
 
     bool quantize_y = ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0;
 
-    // Check for mmq first
-    vk_matmul_pipeline mmp = quantize_y ? ggml_vk_get_mul_mat_mat_pipeline(ctx, src0->type, GGML_TYPE_Q8_1, (ggml_prec)dst->op_params[0]) : nullptr;
+    // Phase 3d: route Q4_0 through the SoA-aware path when the SoA flag is on.
+    // The stock direct-Q4_0 matmul kernels read AoS bytes, which are no longer present
+    // in the buffer (repack-at-upload reorders to SoA). If neither SoA-MMQ nor SoA-MM
+    // fits the op shape, we fall through to the SoA dequant-to-fp16 path.
+    const bool force_q4_0_soa_dequant =
+        vk_q4_0_soa_enabled && src0->type == GGML_TYPE_Q4_0;
 
-    if (mmp == nullptr) {
+    // Phase 3i: SoA Q4_0 MMQ path. Preferred over SoA-MM when integer_dot_product is
+    // available and B can be quantized to Q8_1. Reads WQ u32 quants from binding 0 and
+    // WS fp16 scales from binding 3, same in-place SoA layout as SoA-MM.
+    const bool use_q4_0_soa_mmq =
+        force_q4_0_soa_dequant &&
+        quantize_y &&
+        !y_non_contig &&
+        ggml_vk_dim01_contiguous(src0) && ggml_vk_dim01_contiguous(src1) &&
+        ne00 % 32 == 0 &&
+        ctx->device->pipeline_dequant_mul_mat_mat_q4_0_soa_q8_1.f32acc != nullptr &&
+        !ctx->device->pipeline_dequant_mul_mat_mat_q4_0_soa_q8_1.f32acc->is_empty();
+
+    if (force_q4_0_soa_dequant && !use_q4_0_soa_mmq) {
+        quantize_y = false;
+    }
+
+    // Phase 3g (reworked): SoA Q4_0 prefill path using stock mul_mm tile machinery
+    // (matmul_q4_0_soa_f32 pipeline compiled from mul_mm.comp with Q4_0_SOA defined).
+    // Used when MMQ-SoA isn't available (e.g. no int-dot, or B not Q8_1-eligible).
+    const bool use_q4_0_soa_mm =
+        force_q4_0_soa_dequant && !use_q4_0_soa_mmq &&
+        src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+        !y_non_contig &&
+        ggml_vk_dim01_contiguous(src0) && ggml_vk_dim01_contiguous(src1) &&
+        ne00 % 32 == 0 &&
+        ctx->device->pipeline_dequant_mul_mat_mat_q4_0_soa.f32acc != nullptr &&
+        !ctx->device->pipeline_dequant_mul_mat_mat_q4_0_soa.f32acc->is_empty();
+
+    const bool use_q4_0_soa_any = use_q4_0_soa_mmq || use_q4_0_soa_mm;
+
+    // Check for mmq first
+    vk_matmul_pipeline mmp = (!force_q4_0_soa_dequant && quantize_y) ? ggml_vk_get_mul_mat_mat_pipeline(ctx, src0->type, GGML_TYPE_Q8_1, (ggml_prec)dst->op_params[0]) : nullptr;
+
+    if (use_q4_0_soa_mmq) {
+        mmp = ctx->device->pipeline_dequant_mul_mat_mat_q4_0_soa_q8_1.f32acc;
+    } else if (use_q4_0_soa_mm) {
+        mmp = ctx->device->pipeline_dequant_mul_mat_mat_q4_0_soa.f32acc;
+    } else if (mmp == nullptr && !force_q4_0_soa_dequant) {
         // Fall back to f16 dequant mul mat
         mmp = ggml_vk_get_mul_mat_mat_pipeline(ctx, src0->type, y_non_contig ? f16_type : src1->type, (ggml_prec)dst->op_params[0]);
         quantize_y = false;
     }
 
-    const bool qx_needs_dequant = mmp == nullptr || x_non_contig;
+    const bool qx_needs_dequant = !use_q4_0_soa_any && (mmp == nullptr || x_non_contig || force_q4_0_soa_dequant);
     const bool qy_needs_dequant = !quantize_y && ((src1->type != f16_type && !y_f32_kernel) || y_non_contig);
 
     if (qx_needs_dequant) {
@@ -7573,7 +7711,8 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     const uint64_t y_ne = padded_n * ne10 * ne12 * ne13;
     const uint64_t d_ne = ggml_nelements(dst);
 
-    const uint32_t split_k = ggml_vk_guess_split_k(ctx, ne01, ne11, ne10, disable_split_k, pipeline);
+    // SoA Q4_0 matmul has a 4th descriptor (WS) and no split-K reduce path; force split_k=1.
+    const uint32_t split_k = use_q4_0_soa_any ? 1 : ggml_vk_guess_split_k(ctx, ne01, ne11, ne10, disable_split_k, pipeline);
 
     const uint64_t qx_sz = ggml_type_size(src0->type) * x_ne / ggml_blck_size(src0->type);
     const uint64_t qy_sz = ggml_type_size(src1->type) * y_ne / ggml_blck_size(src1->type);
@@ -7724,14 +7863,36 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     }
 
     // compute
-    ggml_vk_matmul(
-        ctx, subctx, pipeline,
-        { d_X, x_buf_offset, x_sz }, { d_Y, y_buf_offset, y_sz },
-        ggml_vk_subbuffer(ctx, d_D, d_buf_offset), { ctx->prealloc_split_k, 0, d_sz * split_k },
-        ne01, ne11, ne10,
-        ne10, ne10, stride_d, stride_batch_x, stride_batch_y, stride_batch_d,
-        split_k, ne12*ne13, ne02, ne12, r2, r3, padded_n
-    );  // NOLINT
+    if (use_q4_0_soa_any) {
+        // SoA Q4_0: single buffer holds [WQ qs region | WS fp16 scales region].
+        // WQ starts at x_buf_offset; WS starts immediately after WQ.
+        // Works for both MM (B f32) and MMQ (B q8_1); in either case we pass the WS
+        // as the 4th descriptor to the SoA-aware pipeline.
+        const uint64_t wq_row_bytes    = (uint64_t)ne00 / 2;
+        const uint64_t ws_row_bytes    = ((uint64_t)ne00 / 32) * sizeof(uint16_t);
+        const uint64_t batches         = (uint64_t)ne02 * ne03;
+        const uint64_t wq_total_bytes  = (uint64_t)ne01 * wq_row_bytes * batches;
+        const uint64_t ws_total_bytes  = (uint64_t)ne01 * ws_row_bytes * batches;
+        ggml_vk_matmul_q4_0_soa(
+            ctx, subctx, pipeline,
+            { d_X, x_buf_offset, wq_total_bytes },
+            { d_X, x_buf_offset + wq_total_bytes, ws_total_bytes },
+            { d_Y, y_buf_offset, y_sz },
+            ggml_vk_subbuffer(ctx, d_D, d_buf_offset),
+            ne01, ne11, ne10,
+            ne10, ne10, stride_d, stride_batch_x, stride_batch_y, stride_batch_d,
+            ne12*ne13, ne02, ne12, r2, r3, padded_n
+        );
+    } else {
+        ggml_vk_matmul(
+            ctx, subctx, pipeline,
+            { d_X, x_buf_offset, x_sz }, { d_Y, y_buf_offset, y_sz },
+            ggml_vk_subbuffer(ctx, d_D, d_buf_offset), { ctx->prealloc_split_k, 0, d_sz * split_k },
+            ne01, ne11, ne10,
+            ne10, ne10, stride_d, stride_batch_x, stride_batch_y, stride_batch_d,
+            split_k, ne12*ne13, ne02, ne12, r2, r3, padded_n
+        );  // NOLINT
+    }
 
     if (x_non_contig || qx_needs_dequant) {
         ctx->prealloc_x_need_sync = true;
@@ -7843,6 +8004,66 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
 
     const uint64_t r2 = ne12 / ne02;
     const uint64_t r3 = ne13 / ne03;
+
+    // Phase 3d: experimental SoA Q4_0 MMV fast path (n=1, type Q4_0, f32 x f32 -> f32).
+    // Weights have been repacked to SoA at upload (see ggml_backend_vk_buffer_set_tensor).
+    // Shader hardcodes ROWS_PER_WG=8 and local_size_x=64, so guard on M%8 && K%32.
+    // Single-batch only (no GQA broadcast, no batch_n): the shader's push layout is {M,K}
+    // with no batch strides. Any Q4_0 MMV that misses the fast path is routed through
+    // ggml_vk_mul_mat_q_f16 below — it MUST NOT fall through to the stock direct-Q4_0
+    // MMV, which would read AoS bytes from the SoA-packed buffer.
+    if (vk_q4_0_soa_enabled &&
+        src0->type == GGML_TYPE_Q4_0 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+        ne11 == 1 && ne12 == 1 && ne13 == 1 && ne02 == 1 && ne03 == 1 &&
+        ne01 % 8 == 0 && ne00 % 32 == 0 &&
+        ggml_vk_dim01_contiguous(src0) && ggml_vk_dim01_contiguous(src1) &&
+        ctx->num_additional_fused_ops == 0) {
+        vk_pipeline pipeline = ctx->device->pipeline_dequant_mul_mat_vec_q4_0_soa_f32_f32;
+        GGML_ASSERT(pipeline != nullptr);
+
+        const uint32_t M = (uint32_t)ne01;
+        const uint32_t K = (uint32_t)ne00;
+
+        ggml_backend_vk_buffer_context * src0_buf_ctx = (ggml_backend_vk_buffer_context *)src0->buffer->context;
+        ggml_backend_vk_buffer_context * src1_buf_ctx = (ggml_backend_vk_buffer_context *)src1->buffer->context;
+        ggml_backend_vk_buffer_context * dst_buf_ctx  = (ggml_backend_vk_buffer_context *)dst->buffer->context;
+
+        vk_buffer d_Qx_ = src0_buf_ctx->dev_buffer;
+        vk_buffer d_Qy_ = src1_buf_ctx->dev_buffer;
+        vk_buffer d_D_  = dst_buf_ctx->dev_buffer;
+        const size_t src0_off = vk_tensor_offset(src0) + src0->view_offs;
+        const size_t src1_off = vk_tensor_offset(src1) + src1->view_offs;
+        const size_t dst_off  = vk_tensor_offset(dst)  + dst->view_offs;
+
+        const size_t wq_bytes = (size_t)M * (K / 2);
+        const size_t ws_bytes = (size_t)M * (K / 32) * sizeof(uint16_t);
+        const size_t y_bytes  = (size_t)K * sizeof(float);
+        const size_t d_bytes  = (size_t)M * sizeof(float);
+
+        ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+        ggml_vk_sync_buffers(ctx, subctx);
+
+        struct { uint32_t M; uint32_t K; } pc = { M, K };
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+            {
+                vk::DescriptorBufferInfo{ d_Qx_->buffer, src0_off,              wq_bytes },
+                vk::DescriptorBufferInfo{ d_Qy_->buffer, src1_off,              y_bytes  },
+                vk::DescriptorBufferInfo{ d_D_->buffer,  dst_off,               d_bytes  },
+                vk::DescriptorBufferInfo{ d_Qx_->buffer, src0_off + wq_bytes,   ws_bytes },
+            },
+            pc, { M, 1, 1 });
+        return;
+    }
+
+    // Phase 3e: any Q4_0 MMV that didn't hit the SoA fast path (batched n>1, GQA
+    // broadcast, misaligned shape, fused op, etc.) MUST NOT fall through to the
+    // stock direct-Q4_0 MMV, which reads AoS bytes — our buffer has been repacked
+    // to SoA at upload. Route through the matmul path, which force_q4_0_soa_dequant
+    // sends through the SoA dequant shader and then runs fp16 matmul.
+    if (vk_q4_0_soa_enabled && src0->type == GGML_TYPE_Q4_0) {
+        ggml_vk_mul_mat_q_f16(ctx, subctx, src0, src1, dst, false);
+        return;
+    }
 
     // batch_n indicates that we need to compute a few vector results, and this assumes
     // ne12 and ne13 are 1. It overloads the batch_strides to hold the row strides.
@@ -13599,6 +13820,45 @@ static void ggml_backend_vk_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml
         return;
     }
 
+    // Phase 3d: when the experimental SoA Q4_0 path is enabled, intercept full-tensor
+    // Q4_0 weight uploads and reorder AoS blocks to SoA layout on CPU before the write.
+    // AoS per block: [d (2B) | qs (16B)]; SoA per row: [qs bytes | d bytes]; total size
+    // is identical (K/2 quant bytes + K/16 scale bytes per row), so we repack into a
+    // temp CPU buffer and write the same byte count to the same device offset. Only full
+    // uploads (offset==0 && size==ggml_nbytes) are intercepted; partial writes fall
+    // through to the stock path.
+    if (vk_q4_0_soa_enabled && tensor->type == GGML_TYPE_Q4_0 && offset == 0 && size == ggml_nbytes(tensor)) {
+        const uint32_t K = (uint32_t)tensor->ne[0];
+        const uint64_t M = (uint64_t)tensor->ne[1] * tensor->ne[2] * tensor->ne[3];
+        if (K % 32 == 0) {
+            const size_t nbk     = (size_t)K / 32;
+            const size_t wq_row  = K / 2;
+            const size_t ws_row  = nbk * sizeof(uint16_t);
+            const size_t aos_row = nbk * 18;
+            const size_t total   = (size_t)M * (wq_row + ws_row);
+            GGML_ASSERT(total == size);
+
+            std::vector<uint8_t> repacked(total);
+            uint8_t  * wq_base = repacked.data();
+            uint16_t * ws_base = reinterpret_cast<uint16_t *>(repacked.data() + (size_t)M * wq_row);
+            const uint8_t * aos = reinterpret_cast<const uint8_t *>(data);
+            for (uint64_t r = 0; r < M; ++r) {
+                const uint8_t * arow = aos + (size_t)r * aos_row;
+                uint8_t       * qrow = wq_base + (size_t)r * wq_row;
+                uint16_t      * srow = ws_base + (size_t)r * nbk;
+                for (size_t b = 0; b < nbk; ++b) {
+                    const uint8_t * blk = arow + b * 18;
+                    std::memcpy(&srow[b],      blk,     sizeof(uint16_t));
+                    std::memcpy(qrow + b * 16, blk + 2, 16);
+                }
+            }
+            GGML_LOG_INFO("ggml_vulkan: repacked tensor %s to SoA (%zu bytes)\n",
+                          tensor->name, total);
+            ggml_vk_buffer_write(buf, vk_tensor_offset(tensor) + tensor->view_offs, repacked.data(), total);
+            return;
+        }
+    }
+
     ggml_vk_buffer_write(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, data, size);
 }
 
@@ -14540,6 +14800,13 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->num_additional_fused_ops = num_adds - 1;
                 fusion_string = "MULTI_ADD";
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, true);
+            } else if (vk_q4_0_soa_enabled &&
+                       cgraph->nodes[i]->op == GGML_OP_MUL_MAT &&
+                       cgraph->nodes[i]->src[0] &&
+                       cgraph->nodes[i]->src[0]->type == GGML_TYPE_Q4_0) {
+                // Our SoA Q4_0 MMV/MMQ kernels don't support fused ADDs, and
+                // the stock fused MUL_MAT+ADD path would read AoS bytes from
+                // our SoA-packed buffer. Skip fusion for Q4_0 MUL_MAT.
             } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_ADD })) {
                 ctx->num_additional_fused_ops = 2;
                 fusion_string = "MUL_MAT_ADD_ADD";

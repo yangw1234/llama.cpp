@@ -50,10 +50,17 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
             const uint buf_idx = col * SHMEM_STRIDE + row * LOAD_VEC_A / 4;
 
             const uint ib = idx / 4;
-            const uint iqs = idx & 0x03;
 
+#ifdef Q4_0_SOA
+            // SoA layout: qs[] and scales[] live in separate regions of the same binding.
+            // idx already points to the correct u32 within the qs region.
+            const float d = float(data_a_ws[ib]);
+            const uint vui = data_a_wq32[idx];
+#else
+            const uint iqs = idx & 0x03;
             const float d = float(data_a_packed16[ib].d);
             const uint vui = uint(data_a_packed16[ib].qs[2*iqs]) | (uint(data_a_packed16[ib].qs[2*iqs + 1]) << 16);
+#endif
             const vec4 v0 = (vec4(unpack8(vui & 0x0F0F0F0F)) - 8.0f) * d;
             const vec4 v1 = (vec4(unpack8((vui >> 4) & 0x0F0F0F0F)) - 8.0f) * d;
 
