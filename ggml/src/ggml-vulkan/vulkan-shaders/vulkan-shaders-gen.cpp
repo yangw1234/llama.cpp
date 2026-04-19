@@ -748,10 +748,6 @@ void process_shaders() {
     // Fixed bindings: 0=WQ uint32, 1=Xs float, 2=Ys float, 3=WS float16. No defines, no spec constants.
     string_to_spv("mul_mat_vec_q4_0_soa_f32_f32", "mul_mat_vec_q4_0_soa.comp", {});
 
-    // Phase 3d: SoA q4_0 dequant-to-fp16 shader (prefill fallback). Matches stock
-    // dequant_q4_0's 2-binding + 5-uint push interface and wg_denoms {256*16, 1, 1}.
-    string_to_spv("dequant_q4_0_soa", "dequant_q4_0_soa.comp", {});
-
     string_to_spv("get_rows_i32", "get_rows.comp", {{"TEMP_TYPE", "uint"}, {"A_TYPE", "uint"}, {"B_TYPE", "int"}, {"D_TYPE", "uint"}});
 
     string_to_spv("mul_mat_vec_p021_f16_f32_subgroup_add", "mul_mat_vec_p021.comp", {{"A_TYPE", "float16_t"}, {"A_TYPEV4", "f16vec4"}, {"B_TYPE", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}});
