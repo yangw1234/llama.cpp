@@ -352,3 +352,42 @@ Also renamed `force_q4_0_soa_dequant` → `is_soa`, `use_q4_0_soa_mmq/mm/any` �
 
 12. **Unreachable-but-present scaffolding hides cost.** The dequant fallback was written defensively in Phase 3d (when the MMV fast path was the only SoA dispatch) and stayed past Phase 3i when MMQ-SoA made it unreachable. 72 lines of shader + 3 host-side integration points + one `ggml_vk_get_to_fp16` override all for a branch that never fires on our target. After 3i hard-confirmed it's dead (via the `mmq=201 mm=0 fallback=0` counter), replacing it with `GGML_ASSERT(!is_soa || use_soa_any)` converts the hidden dead code into an explicit correctness contract — if an edge case ever does show up (exotic shape, new device without int-dot), we get a hard fail with a useful stack, not silent garbage.
 13. **A type predicate is easier to extend than a per-site gate.** The original `vk_q4_0_soa_enabled && X->type == GGML_TYPE_Q4_0` pattern had to be changed everywhere to support a second SoA type. With `vk_is_soa_type(t)`, adding Q5_0/Q8_0 is a one-line change in the helper (and then pipeline/shader variants for the new type) — call sites stay unchanged. This mirrors how llama.cpp itself uses predicates like `ggml_is_contiguous` rather than inlining stride checks.
+
+---
+
+## plot_perf.py — per-phase / per-layer GPU time breakdown
+
+Local-only helper (not upstream) that turns a `GGML_VK_PERF_LOGGER=1` dump into two PNGs: `prefill_v2.png` and `decode_v2.png`. Each PNG has two panels: (a) between-component bars (linear-attn block avg, full-attn block avg, embedding, LM head, final norm) and (b) a stacked within-block decomposition (RMSNorm, Q/KV proj, RoPE, FlashAttention, GatedDeltaNet core, SSM conv, FFN gate+up / down, elementwise, etc.).
+
+Hardcoded for Qwen3.5-2B (24 hybrid blocks = 18 Gated-DeltaNet + 6 full-attn, `d=2048`, `ff=6144`, `n_q=16`, `n_kv=2`, `head_dim=256`, vocab≈248320). The `classify()` shape regexes will need updating for any other model.
+
+### How to use
+
+1. **Produce a perf log.** Run llama-bench (or any llama.cpp binary) with the Vulkan perf logger on:
+   ```
+   GGML_VK_PERF_LOGGER=1 ./build/bin/llama-bench \
+       -m <model>.gguf -p 64 -n 32 -ngl 99 -r 2 \
+       > C:/Users/yangwan7/sources/perf_bench.log 2>&1
+   ```
+   Each benchmark emits a `Vulkan Timings: … Total time: …` block; the script indexes those blocks in order.
+
+2. **Pick which dumps to plot.** `llama-bench` emits them as: `0 = pp warmup`, `1 = pp real`, `2 = tg warmup`, `3..N = tg tokens`. Defaults at the top of the file:
+   - `PREFILL_DUMP_IDX = 1` (real prefill, post-warmup)
+   - `DECODE_DUMP_IDX  = 3` (first real tg token)
+   Edit these if you ran a different command, or if you want a different sample.
+
+3. **Point the paths at your log and output dir.** Edit `LOG` and `OUT_DIR` at the top of the script (currently `C:\Users\yangwan7\sources\perf_bench.log` and `C:\Users\yangwan7\sources`).
+
+4. **Run it.**
+   ```
+   python plot_perf.py
+   ```
+   Prints the total µs for prefill and decode to stdout and writes `prefill_v2.png` + `decode_v2.png` into `OUT_DIR`. Requires only `matplotlib`.
+
+### How the bucketing works (for sanity-checking a new run)
+
+- `parse_dumps()` splits on `Vulkan Timings:` / `Total time:` markers; `parse_dump()` pulls `NAME: K x AVG us = TOTAL us` lines.
+- `classify(op_name, count)` maps each op to `(block_type, component)` where `block_type ∈ {full, lin, both, embed, lm_head, final, misc}`. Matching is by shape substring (e.g. `q4_0 m=4096 .*k=2048` → full-attn Q proj; `q5_K m=2048 … k=2048` → DeltaNet o_proj; `GATED_DELTA_NET` → deltanet_core).
+- `bucketize()` folds the shared FFN ops (block_type `both`) into `full` and `lin` weighted by block count (`6:18`), then divides each block_type's totals by its block count to get a per-block average. Standalone components (embedding, LM head, final RMSNorm) are whole-model totals, not averaged.
+
+If a run shows a suspiciously large `Other` or `elementwise` slice, a shape is probably unmatched — add a new regex branch to `classify()`.
