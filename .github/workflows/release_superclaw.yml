@@ -1,0 +1,92 @@
+name: Release (superclaw, win-vulkan-x64 only)
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  BRANCH_NAME: ${{ github.head_ref || github.ref_name }}
+  VULKAN_VERSION: 1.4.313.2
+  CMAKE_ARGS: "-DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DGGML_RPC=ON"
+
+jobs:
+  windows-vulkan-x64:
+    runs-on: windows-2025
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Determine tag name
+        id: tag
+        uses: ./.github/actions/get-tag-name
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: superclaw-windows-vulkan-x64
+          variant: ccache
+          evict-old-files: 1d
+
+      - name: Install Ninja
+        run: choco install ninja
+
+      - name: Install Vulkan SDK
+        run: |
+          curl.exe -o $env:RUNNER_TEMP/VulkanSDK-Installer.exe -L "https://sdk.lunarg.com/sdk/download/${env:VULKAN_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_VERSION}.exe"
+          & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\${env:VULKAN_VERSION}"
+          Add-Content $env:GITHUB_PATH "C:\VulkanSDK\${env:VULKAN_VERSION}\bin"
+
+      # --- Build 1: CPU side (exes, llama.dll, ggml-base.dll, ggml-cpu-*.dll, ggml-rpc.dll, mtmd.dll, ...)
+      # Mirrors .github/workflows/release.yml windows-cpu job.
+      - name: Build CPU
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -S . -B build-cpu -G "Ninja Multi-Config" ^
+            -D CMAKE_TOOLCHAIN_FILE=cmake/x64-windows-llvm.cmake ^
+            -DLLAMA_BUILD_BORINGSSL=ON ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_BACKEND_DL=ON ^
+            -DGGML_CPU_ALL_VARIANTS=ON ^
+            -DGGML_OPENMP=ON ^
+            %CMAKE_ARGS%
+          cmake --build build-cpu --config Release
+
+      # --- Build 2: Vulkan backend DLL only.
+      # Mirrors .github/workflows/release.yml windows job, vulkan matrix entry.
+      - name: Build Vulkan DLL
+        shell: cmd
+        run: |
+          cmake -S . -B build-vulkan ^
+            -DGGML_VULKAN=ON ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_CPU=OFF ^
+            -DGGML_BACKEND_DL=ON ^
+            -DLLAMA_BUILD_BORINGSSL=ON
+          cmake --build build-vulkan --config Release --target ggml-vulkan
+
+      - name: Merge artifacts
+        shell: pwsh
+        run: |
+          # Copy libomp140.x86_64.dll (runtime dep of llvm OpenMP) — same path as release.yml uses.
+          Copy-Item "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Redist\MSVC\14.44.35112\debug_nonredist\x64\Microsoft.VC143.OpenMP.LLVM\libomp140.x86_64.dll" .\build-cpu\bin\Release\
+          # Drop the vulkan backend DLL into the CPU bin dir.
+          Copy-Item .\build-vulkan\bin\Release\ggml-vulkan.dll .\build-cpu\bin\Release\
+
+      - name: Pack zip
+        shell: pwsh
+        run: |
+          7z a -snl "llama-${{ steps.tag.outputs.name }}-bin-win-vulkan-x64.zip" .\build-cpu\bin\Release\*
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          path: llama-${{ steps.tag.outputs.name }}-bin-win-vulkan-x64.zip
+          name: llama-${{ steps.tag.outputs.name }}-bin-win-vulkan-x64.zip
