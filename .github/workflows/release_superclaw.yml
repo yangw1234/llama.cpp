@@ -26,13 +26,6 @@ jobs:
         id: tag
         uses: ./.github/actions/get-tag-name
 
-      - name: ccache
-        uses: ggml-org/ccache-action@v1.2.21
-        with:
-          key: superclaw-windows-vulkan-x64
-          variant: ccache
-          evict-old-files: 1d
-
       - name: Install Ninja
         run: choco install ninja
 
