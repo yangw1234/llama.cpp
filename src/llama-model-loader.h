@@ -89,6 +89,13 @@ struct llama_model_loader {
     std::map<std::string, llama_tensor_weight, weight_name_comparer> weights_map;
     std::unordered_map<std::string, llama_model_kv_override> kv_overrides;
     const llama_model_tensor_buft_override * tensor_buft_overrides;
+    bool requant_enabled = false;
+
+    // tensors that get dequantized -> requantized at load_all_data time.
+    // maps tensor name -> original on-disk type. The working tensor's `type`
+    // is rewritten to the target type in create_tensor() so the buffer is
+    // sized for the target type before allocation.
+    std::unordered_map<std::string, ggml_type> requant_orig_type;
 
     gguf_context_ptr metadata_ptr;
     struct gguf_context * metadata; // either metadata_ptr.get() or externally set
@@ -131,7 +138,8 @@ struct llama_model_loader {
         bool check_tensors,
         bool no_alloc,
         const llama_model_kv_override * param_overrides_p,
-        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p);
+        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p,
+        int8_t param_requant = -1);
 
     template<typename T>
     typename std::enable_if<std::is_integral<T>::value, bool>::type

@@ -42,7 +42,7 @@ test parameters:
   -pg <pp,tg>                               (default: )
   -d, --n-depth <n>                         (default: 0)
   -b, --batch-size <n>                      (default: 2048)
-  -ub, --ubatch-size <n>                    (default: 512)
+  -ub, --ubatch-size <n>                    (default: 2048)
   -ctk, --cache-type-k <t>                  (default: f16)
   -ctv, --cache-type-v <t>                  (default: f16)
   -t, --threads <n>                         (default: system dependent)

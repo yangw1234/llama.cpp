@@ -342,6 +342,7 @@ struct cmd_params {
     std::vector<bool>                embeddings;
     std::vector<bool>                no_op_offload;
     std::vector<bool>                no_host;
+    int8_t                           requant;  // -1 auto, 0 off, 1 on
     std::vector<size_t>              fit_params_target;
     std::vector<uint32_t>            fit_params_min_ctx;
     ggml_numa_strategy               numa;
@@ -365,7 +366,7 @@ static const cmd_params cmd_params_defaults = {
     /* n_pg                 */ {},
     /* n_depth              */ { 0 },
     /* n_batch              */ { 2048 },
-    /* n_ubatch             */ { 512 },
+    /* n_ubatch             */ { 2048 },
     /* type_k               */ { GGML_TYPE_F16 },
     /* type_v               */ { GGML_TYPE_F16 },
     /* n_threads            */ { cpu_get_num_math() },
@@ -386,6 +387,7 @@ static const cmd_params cmd_params_defaults = {
     /* embeddings           */ { false },
     /* no_op_offload        */ { false },
     /* no_host              */ { false },
+    /* requant              */ -1,    // auto: on for qwen35/qwen35moe; opt-in only for gemma4 (--requant on)
     /* fit_params_target    */ { 0 },
     /* fit_params_min_ctx   */ { 0 },
     /* numa                 */ GGML_NUMA_STRATEGY_DISABLED,
@@ -457,6 +459,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("                                              (default: disabled)\n");
     printf("  -nopo, --no-op-offload <0|1>                (default: 0)\n");
     printf("  --no-host <0|1>                             (default: %s)\n", join(cmd_params_defaults.no_host, ",").c_str());
+    printf("  --requant <auto|on|off>                     load-time requant of always-on tensors to Q4_K. (default: auto = on for qwen35/qwen35moe; gemma4 opt-in via --requant on)\n");
     printf("\n");
     printf(
         "Multiple values can be given for each parameter by separating them with ','\n"
@@ -509,9 +512,22 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     params.delay                = cmd_params_defaults.delay;
     params.progress             = cmd_params_defaults.progress;
     params.no_warmup            = cmd_params_defaults.no_warmup;
+    params.requant              = cmd_params_defaults.requant;
 
     if (const char * env = getenv("HF_TOKEN")) {
         params.hf_token = env;
+    }
+    if (const char * env = getenv("LLAMA_ARG_REQUANT")) {
+        const std::string v = env;
+        if (v == "on" || v == "1" || v == "true") {
+            params.requant = 1;
+        } else if (v == "off" || v == "0" || v == "false") {
+            params.requant = 0;
+        } else if (v == "auto" || v == "-1" || v.empty()) {
+            params.requant = -1;
+        } else {
+            fprintf(stderr, "warning: ignoring unrecognized LLAMA_ARG_REQUANT='%s' (expected auto|on|off)\n", env);
+        }
     }
 
     for (int i = 1; i < argc; i++) {
@@ -824,6 +840,23 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = string_split<bool>(argv[i], split_delim);
                 params.no_host.insert(params.no_host.end(), p.begin(), p.end());
+            } else if (arg == "--requant") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                std::string v = argv[i];
+                if (v == "on" || v == "1" || v == "true") {
+                    params.requant = 1;
+                } else if (v == "off" || v == "0" || v == "false") {
+                    params.requant = 0;
+                } else if (v == "auto" || v == "-1") {
+                    params.requant = -1;
+                } else {
+                    fprintf(stderr, "error: invalid --requant value: '%s' (expected auto|on|off)\n", v.c_str());
+                    invalid_param = true;
+                    break;
+                }
             } else if (arg == "-ts" || arg == "--tensor-split") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1139,6 +1172,7 @@ struct cmd_params_instance {
     bool               embeddings;
     bool               no_op_offload;
     bool               no_host;
+    int8_t             requant;
     size_t             fit_target;
     uint32_t           fit_min_ctx;
 
@@ -1155,6 +1189,7 @@ struct cmd_params_instance {
         mparams.use_mmap      = use_mmap;
         mparams.use_direct_io = use_direct_io;
         mparams.no_host       = no_host;
+        mparams.requant       = requant;  // tri-state; loader resolves auto by arch and disables mmap when active
 
         if (n_cpu_moe <= 0) {
             if (tensor_buft_overrides.empty()) {
@@ -1202,6 +1237,7 @@ struct cmd_params_instance {
                use_mmap == other.use_mmap && use_direct_io == other.use_direct_io &&
                devices == other.devices &&
                no_host == other.no_host &&
+               requant == other.requant &&
                vec_tensor_buft_override_equal(tensor_buft_overrides, other.tensor_buft_overrides);
     }
 
@@ -1285,6 +1321,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .embeddings   = */ embd,
                 /* .no_op_offload= */ nopo,
                 /* .no_host      = */ noh,
+                /* .requant      = */ params.requant,
                 /* .fit_target   = */ fpt,
                 /* .fit_min_ctx  = */ fpc,
             };
@@ -1322,6 +1359,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .embeddings   = */ embd,
                 /* .no_op_offload= */ nopo,
                 /* .no_host      = */ noh,
+                /* .requant      = */ params.requant,
                 /* .fit_target   = */ fpt,
                 /* .fit_min_ctx  = */ fpc,
             };
@@ -1359,6 +1397,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .embeddings   = */ embd,
                 /* .no_op_offload= */ nopo,
                 /* .no_host      = */ noh,
+                /* .requant      = */ params.requant,
                 /* .fit_target   = */ fpt,
                 /* .fit_min_ctx  = */ fpc,
             };
@@ -1401,6 +1440,7 @@ struct test {
     bool                     embeddings;
     bool                     no_op_offload;
     bool                     no_host;
+    int8_t                   requant;
     size_t                   fit_target;
     uint32_t                 fit_min_ctx;
     int                      n_prompt;
@@ -1441,6 +1481,7 @@ struct test {
         embeddings     = inst.embeddings;
         no_op_offload  = inst.no_op_offload;
         no_host        = inst.no_host;
+        requant        = inst.requant;
         fit_target     = inst.fit_target;
         fit_min_ctx    = inst.fit_min_ctx;
         n_prompt       = inst.n_prompt;
@@ -1500,7 +1541,7 @@ struct test {
             "type_k",         "type_v",         "n_gpu_layers",  "n_cpu_moe",      "split_mode",
             "main_gpu",       "no_kv_offload",  "flash_attn",    "devices",        "tensor_split",
             "tensor_buft_overrides",            "use_mmap",      "use_direct_io",  "embeddings",
-            "no_op_offload",  "no_host",        "fit_target",     "fit_min_ctx",
+            "no_op_offload",  "no_host",        "requant",       "fit_target",     "fit_min_ctx",
             "n_prompt",       "n_gen",          "n_depth",
             "test_time",      "avg_ns",         "stddev_ns",     "avg_ts",         "stddev_ts"
         };
@@ -1595,6 +1636,7 @@ struct test {
                                             std::to_string(embeddings),
                                             std::to_string(no_op_offload),
                                             std::to_string(no_host),
+                                            (requant == 1 ? "on" : (requant == 0 ? "off" : "auto")),
                                             std::to_string(fit_target),
                                             std::to_string(fit_min_ctx),
                                             std::to_string(n_prompt),
@@ -1791,6 +1833,9 @@ struct markdown_printer : public printer {
         if (field == "no_host") {
             return 4;
         }
+        if (field == "requant") {
+            return -4;  // STRING: left-aligned, fits "auto"
+        }
 
         int width = std::max((int) field.length(), 10);
 
@@ -1830,6 +1875,9 @@ struct markdown_printer : public printer {
         }
         if (field == "no_host") {
             return "noh";
+        }
+        if (field == "requant") {
+            return "rq";
         }
         if (field == "devices") {
             return "dev";
@@ -1923,6 +1971,9 @@ struct markdown_printer : public printer {
         }
         if (params.no_host.size() > 1 || params.no_host != cmd_params_defaults.no_host) {
             fields.emplace_back("no_host");
+        }
+        if (params.requant != cmd_params_defaults.requant) {
+            fields.emplace_back("requant");
         }
         if (params.fit_params_target.size() > 1 || params.fit_params_target != cmd_params_defaults.fit_params_target) {
             fields.emplace_back("fit_target");

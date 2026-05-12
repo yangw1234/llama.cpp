@@ -119,7 +119,11 @@ layout (constant_id = 3) const uint BK = 16;  // Assumed to be 32 if working wit
 #define BK_STEP 2
 #endif
 
-#ifdef COOPMAT
+#if defined(COOPMAT) && defined(LOAD_A_OPT)
+// A-tile uses TK/2-stride layout (LOAD_A_OPT); SHMEM_STRIDE only governs B-tile.
+// No padding needed: smaller SLM reduces per-WG footprint, improving occupancy.
+#define SHMEM_STRIDE (BK / 2)
+#elif defined(COOPMAT)
 #define SHMEM_STRIDE (BK / 2 + 4)
 #else
 #define SHMEM_STRIDE (BK / 2 + 1)
@@ -226,6 +230,10 @@ void main() {
 
     // Workgroup has no work
     if (ic * BN >= _ne1) return;
+
+    uint required_work_items = (_ne1 - ic * BN) * BK / LOAD_VEC_B;
+    uint required_warp_c = (_ne1 - ic * BN + WN - 1) / WN ;
+
 #endif
 
 #ifdef MUL_MAT_ID
@@ -250,8 +258,8 @@ void main() {
 #endif
 
 #ifdef COOPMAT
-    coopmat<FLOAT_TYPE, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> cache_a;
-    coopmat<FLOAT_TYPE, gl_ScopeSubgroup, TK, TN, gl_MatrixUseB> cache_b;
+    coopmat<FLOAT_TYPE, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> cache_a[cms_per_row];
+    coopmat<FLOAT_TYPE, gl_ScopeSubgroup, TK, TN, gl_MatrixUseB> cache_b[cms_per_col];
     coopmat<ACC_TYPE, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> sums[cms_per_row * cms_per_col];
 
     [[unroll]] for (uint i = 0; i < cms_per_row * cms_per_col; i++) {
@@ -272,10 +280,53 @@ void main() {
     }
 #endif
 
+
+#if defined(MUL_MAT_ID) && defined(COOPMAT) && LOAD_VEC_B == 8
+    // Precompute per-lane B-tile base address for li==0.
+    // row_ids are constant across K-blocks; hoists mach + % p.ne11 divrem outside the K-loop.
+    // Used by the BN==loadstride_b fast path (BN/loadstride_b==1); dead-code-eliminated otherwise.
+    const u16vec2 _b_row_idx0 = row_ids[loadc_b];
+    const uint _b_addr_base0  = uint(_b_row_idx0.y) * (p.batch_stride_b / LOAD_VEC_B)
+                              + (uint(_b_row_idx0.x) % p.ne11) * (p.stride_b / LOAD_VEC_B)
+                              + loadr_b;
+#endif
+
     for (uint block = start_k; block < end_k; block += BK) {
         [[unroll]] for (uint l = 0; l < BM; l += loadstride_a) {
             load_a_to_shmem(pos_a, loadr_a, loadc_a + l, ir * BM + loadc_a + l, block, end_k);
         }
+        #ifdef MUL_MAT_ID
+        if (gl_LocalInvocationID.x < required_work_items) {
+        #endif
+#if defined(MUL_MAT_ID) && defined(COOPMAT) && LOAD_VEC_B == 8
+        if (BN == loadstride_b) {
+            // BN/loadstride_b == 1: single direct load, no loop.
+            // BN and loadstride_b are spec-const-derived; compiler eliminates the dead branch.
+            FLOAT_TYPE_VEC8 _bb = FLOAT_TYPE_VEC8(data_b[pos_b + _b_addr_base0]);
+            const uint _b_buf = loadc_b * SHMEM_STRIDE + loadr_b * (LOAD_VEC_B / 2);
+            buf_b[_b_buf + 0] = _bb[0].xy;
+            buf_b[_b_buf + 1] = _bb[0].zw;
+            buf_b[_b_buf + 2] = _bb[1].xy;
+            buf_b[_b_buf + 3] = _bb[1].zw;
+        } else {
+            [[unroll]] for (uint li = 0; li < BN / loadstride_b; li++) {
+                uint _b_a;
+                if (li == 0) {
+                    _b_a = pos_b + _b_addr_base0;
+                } else {
+                    const u16vec2 _b_ri = row_ids[loadc_b + li * loadstride_b];
+                    _b_a = pos_b + uint(_b_ri.y) * (p.batch_stride_b / LOAD_VEC_B)
+                                 + (uint(_b_ri.x) % p.ne11) * (p.stride_b / LOAD_VEC_B) + loadr_b;
+                }
+                FLOAT_TYPE_VEC8 _bb = FLOAT_TYPE_VEC8(data_b[_b_a]);
+                const uint _b_buf = (loadc_b + li * loadstride_b) * SHMEM_STRIDE + loadr_b * (LOAD_VEC_B / 2);
+                buf_b[_b_buf + 0] = _bb[0].xy;
+                buf_b[_b_buf + 1] = _bb[0].zw;
+                buf_b[_b_buf + 2] = _bb[1].xy;
+                buf_b[_b_buf + 3] = _bb[1].zw;
+            }
+        }
+#else
         [[unroll]] for (uint l = 0; l < BN; l += loadstride_b) {
 #if !defined(MUL_MAT_ID)
             load_b_to_shmem(pos_b, loadr_b, loadc_b + l, ic * BN + loadc_b + l, block, end_k);
@@ -283,6 +334,10 @@ void main() {
             load_b_to_shmem(pos_b, loadr_b, loadc_b + l, ic, _ne1, block, end_k);
 #endif
         }
+#endif
+        #ifdef MUL_MAT_ID
+        }
+        #endif
 
         barrier();
 
@@ -290,18 +345,32 @@ void main() {
         pos_b += BK / LOAD_VEC_B;
 
 #ifdef COOPMAT
+#ifdef MUL_MAT_ID
+        if (warp_c < required_warp_c) {
+#endif
         [[unroll]] for (uint i = 0; i < BK; i += TK) {
             [[unroll]] for (uint cm_row = 0; cm_row < cms_per_row; cm_row++) {
                 // Load from shared into cache
-                coopMatLoad(cache_a, buf_a, (warp_r * WM + cm_row * TM) * SHMEM_STRIDE + i / 2, SHMEM_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+#ifndef LOAD_A_OPT
+                coopMatLoad(cache_a[cm_row], buf_a, (warp_r * WM + cm_row * TM) * SHMEM_STRIDE + i / 2, SHMEM_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+#else
+                coopMatLoad(cache_a[cm_row], buf_a, (warp_r * WM + cm_row * TM) * TK / 2 + i * BM / 2, TK / 2, gl_CooperativeMatrixLayoutRowMajor);
+#endif
+            }
 
-                [[unroll]] for (uint cm_col = 0; cm_col < cms_per_col; cm_col++) {
-                    coopMatLoad(cache_b, buf_b, (warp_c * WN + cm_col * TN) * SHMEM_STRIDE + i / 2, SHMEM_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
+            [[unroll]] for (uint cm_col = 0; cm_col < cms_per_col; cm_col++) {
+                coopMatLoad(cache_b[cm_col], buf_b, (warp_c * WN + cm_col * TN) * SHMEM_STRIDE + i / 2, SHMEM_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
+            }
 
-                    sums[cm_col * cms_per_row + cm_row] = coopMatMulAdd(cache_a, cache_b, sums[cm_col * cms_per_row + cm_row]);
+            [[unroll]] for (uint cm_col = 0; cm_col < cms_per_col; cm_col++) {
+                [[unroll]] for (uint cm_row = 0; cm_row < cms_per_row; cm_row++) {
+                    sums[cm_col * cms_per_row + cm_row] = coopMatMulAdd(cache_a[cm_row], cache_b[cm_col], sums[cm_col * cms_per_row + cm_row]);
                 }
             }
         }
+#ifdef MUL_MAT_ID
+        }
+#endif
 #else
         [[unroll]] for (uint i = 0; i < BK / BK_STEP; i++) {
             // Load from shared into cache

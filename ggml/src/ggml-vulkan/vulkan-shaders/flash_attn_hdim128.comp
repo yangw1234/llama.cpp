@@ -1,0 +1,344 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_ballot : enable
+
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer Q {float16_t qState[];};
+layout (binding = 0) readonly buffer Q_VEC2 {f16vec2 qStateVec2[];};
+layout (binding = 1) readonly buffer K {float16_t kState[];};
+layout (binding = 1) readonly buffer K_VEC2 {f16vec4 kStateVec2[];};
+//layout (binding = 1) readonly buffer K_VEC2 {f16mat2x4 kStateVec2[];};
+
+layout (binding = 2) readonly buffer V {float16_t vState[];};
+layout (binding = 2) readonly buffer V_VEC2 {f16vec4 vStateVec2[];};
+layout (binding = 3) buffer MASK {float16_t mState[];};
+layout (binding = 4) buffer SINK {float sinkCoeff[];};
+layout (binding = 5) buffer OUT {vec4 attnOut[];};
+layout (binding = 5) buffer OUT_FP16 {f16vec4 out_f16[];};
+
+layout (push_constant) uniform parameter
+{
+  uint kvSeqLen;
+  uint vCacheStride;
+  uint startActivationIdx;
+  uint activationLength;
+  uint qHead;
+  uint kvHead;
+  uint slidingWindow;
+  uint flag;
+  float softMaxScale;
+} p;
+
+layout (constant_id = 0) const uint GROUPSIZE = 256; // 3 = log2(8)
+layout (constant_id = 1) const uint GQA_RATIO_LOG2 = 3; // 3 = log2(8)
+layout (constant_id = 2) const uint DP = 32;
+layout (constant_id = 3) const uint TN = 16;
+
+#define HEAD_DIM 128
+#define QK_WARP_REDUCE 2
+#define WARPSIZE TN
+#define WARP_DIM (HEAD_DIM / QK_WARP_REDUCE)
+#define GQA_MASK (QK_WARP_REDUCE * (1 << GQA_RATIO_LOG2) - 1)
+#define GQA_RATIO (1 << GQA_RATIO_LOG2)
+
+#define SLM_POOL_SIZE_P (TN * DP * GROUPSIZE / WARPSIZE)
+#define SLM_Q_START 0
+#define SLM_K_START 0
+#define OUTPUT_PER_WORKGROUP (GROUPSIZE / GQA_RATIO / QK_WARP_REDUCE)
+
+#define SLM_POOL_SIZE_K (DP * HEAD_DIM / 2)
+#define SLM_POOL_SIZE_V (DP * HEAD_DIM)
+#define SLM_POOL_SIZE_M (OUTPUT_PER_WORKGROUP * DP)
+#define SLM_POOL_SIZE_REDUCE (OUTPUT_PER_WORKGROUP * GQA_RATIO)
+
+#define K_COUNT (((SLM_POOL_SIZE_K * 2) / GROUPSIZE) / 4)
+#define V_COUNT (((SLM_POOL_SIZE_V) / GROUPSIZE) / 4)
+#define M_COUNT (SLM_POOL_SIZE_M / GROUPSIZE)
+#define MAT_P_COUNT (DP / 8)
+
+#define SUBGROUP_COUNT (GROUPSIZE / WARPSIZE)
+#define K_OUTER (GROUPSIZE / DP)
+#define V_OUTER (GROUPSIZE / DP)
+
+#define K_INNER (16 / K_COUNT / 4)
+
+shared float slm_pool_qp[SLM_POOL_SIZE_P];
+shared f16vec2 slm_pool_k[SLM_POOL_SIZE_K];
+shared float slm_pool_v[SLM_POOL_SIZE_V];
+shared float slm_pool_m[SLM_POOL_SIZE_M];
+shared float slm_pool_pv[SLM_POOL_SIZE_P / 2];
+//shared f16vec2 slm_pool_pv_2[SLM_POOL_SIZE_P / 4];
+shared float slm_historic_max[SLM_POOL_SIZE_REDUCE];
+shared float slm_softmax_compensation[SLM_POOL_SIZE_REDUCE];
+shared float slm_softmax_sum[SLM_POOL_SIZE_REDUCE];
+
+void main() {
+  const uint lane = gl_SubgroupInvocationID;
+  const uint h = gl_WorkGroupID.x;
+  const uint v = gl_WorkGroupID.y;
+  const uint localLinearId = gl_SubgroupID;
+  const uint hhq = localLinearId & GQA_MASK;              // [0, 8)
+  const uint vvq = localLinearId >> (GQA_RATIO_LOG2 + 1); // [0, 2)
+  const uint hhhq = hhq % QK_WARP_REDUCE;         // [0, 1)
+  const uint hhvq = hhq / QK_WARP_REDUCE;         // [0, 3)
+  const uint hhk = localLinearId % K_OUTER;  // [0, 8)
+  const uint vvk = localLinearId / K_OUTER;  // [0, 2)
+  const uint hhhk = hhk % K_INNER;  // [0, 2)
+  const uint vvvk = hhk / K_INNER;  // [0, 4)
+  const uint hhp = localLinearId % QK_WARP_REDUCE;
+  const uint vvp = localLinearId / QK_WARP_REDUCE;
+  const uint hhv = localLinearId % K_OUTER;  // [0, 4)
+  const uint vvv = localLinearId / K_OUTER;  // [0, 4)
+
+  const uint qDim = p.qHead * HEAD_DIM;
+  const uint oDim = qDim;
+  const uint kvDim = p.kvHead * HEAD_DIM;
+  const uint maskDim = p.kvSeqLen;
+  uint offsetBaseK = (vvk * TN * kvDim + hhk * K_COUNT * 4 + lane * kvDim + v * HEAD_DIM) / 4;
+  uint offsetBaseV = (vvv * TN * kvDim + hhv * V_COUNT * 4 + lane * kvDim + v * HEAD_DIM) / 4;
+  uint offsetBaseMask = (h * OUTPUT_PER_WORKGROUP + vvq * TN + lane);
+  offsetBaseMask = min(offsetBaseMask, p.activationLength - 1);
+  offsetBaseMask = (offsetBaseMask * maskDim + hhq * M_COUNT);
+  const uint offsetSlmK = (vvvk * 16 * DP + vvk * TN * 16 + lane * 16 + hhhk * K_COUNT * 4) / 2;
+  const uint offsetSlmV = (vvv * TN * HEAD_DIM + hhv * V_COUNT * 4 + lane * HEAD_DIM);
+  const uint offsetSlmM = (vvq * TN * DP + hhq * M_COUNT + lane * DP);
+  const uint offsetSlmReduce = (vvp * TN + lane);
+  const uint offsetLoadSlmP = (vvp * TN * DP * QK_WARP_REDUCE + lane * DP * QK_WARP_REDUCE); // todo, change this
+  const uint offsetSlmP = (vvp * TN * DP + lane * DP); // todo change this
+  const uint offsetSlmP2 = offsetSlmP / 2; // todo change this
+  const uint offsetSlmLoadV = (lane * HEAD_DIM + hhhq * WARP_DIM);
+  const uint offsetSlmLoadMaskP = (vvq * TN * DP + lane * DP);
+
+  const uint offsetOut =  (h * OUTPUT_PER_WORKGROUP * oDim + (v * GQA_RATIO + hhvq) * HEAD_DIM + hhhq * WARP_DIM + vvq * TN * qDim + lane * oDim) / 4;
+  const float16_t fp16SoftmaxScale = float16_t(p.softMaxScale);
+  const float fp32Min = uintBitsToFloat(0xFEFFFFFF);
+  const uint kvBoundary = ((p.kvSeqLen - 1) * kvDim + (v + 1) * HEAD_DIM) / 4 - 1;
+  const float fp32SinkCoeff = sinkCoeff[v * GQA_RATIO + hhq];
+
+  coopmat<float16_t, gl_ScopeSubgroup, 16, TN, gl_MatrixUseB> matQ[4];
+  float fp32Out[WARP_DIM];
+  const uint coopMatBaseQ = (h * OUTPUT_PER_WORKGROUP * qDim + (v * GQA_RATIO + hhvq) * HEAD_DIM + hhhq * WARP_DIM + vvq * TN * qDim) / 2;
+  [[unroll]] for (uint i = 0; i < 4; i++) {
+    coopMatLoad(
+      matQ[i],
+      qStateVec2,
+      coopMatBaseQ + 8 * i,
+      qDim / 2,
+      gl_CooperativeMatrixLayoutColumnMajor);
+  }
+
+  [[unroll]] for (uint i = 0; i < WARP_DIM; i++) {
+    fp32Out[i] = 0;
+  }
+
+  const uint loopCount = (p.kvSeqLen) / DP;
+  float historicMax = fp32Min;
+  float softmaxSum = 0;
+  for (uint loop = 0; loop < loopCount; loop++) {
+    f16vec4 f16KState[K_COUNT];
+    {
+      coopmat<float, gl_ScopeSubgroup, 8, TN, gl_MatrixUseAccumulator> sums[MAT_P_COUNT];
+      coopmat<float16_t, gl_ScopeSubgroup, 8, 16, gl_MatrixUseA> matK[MAT_P_COUNT];
+
+      float16_t f16MaskState[M_COUNT];
+
+      [[unroll]] for (uint kk = 0; kk < K_COUNT; kk++) {
+        f16KState[kk] = kStateVec2[offsetBaseK + kk];
+      }
+
+      [[unroll]] for (uint kk = 0; kk < M_COUNT; kk++) {
+        f16MaskState[kk] = mState[offsetBaseMask + kk];
+      }
+
+      [[unroll]] for (uint kk = 0; kk < K_COUNT; kk++) {
+        slm_pool_k[SLM_K_START + offsetSlmK + 2 * kk] = f16KState[kk].xy * fp16SoftmaxScale;
+        slm_pool_k[SLM_K_START + offsetSlmK + 2 * kk + 1] = f16KState[kk].zw * fp16SoftmaxScale;
+      }
+
+      [[unroll]] for (uint i = 0; i < 4; i++) {
+        sums[i] = coopmat<float, gl_ScopeSubgroup, 8, TN, gl_MatrixUseAccumulator>(0.0f);
+      }
+
+      barrier();
+      [[unroll]] for (uint dd = 0; dd < 4; dd++) {
+        [[unroll]] for (uint cc = 0; cc < MAT_P_COUNT; cc++) {
+          coopMatLoad(
+            matK[cc],
+            slm_pool_k,
+            hhhq * DP * WARP_DIM / 2 + DP * 8 * dd + 8 * 8 * cc,
+            16 / 2,
+            gl_CooperativeMatrixLayoutRowMajor);
+        }
+
+        [[unroll]] for (uint cc = 0; cc < MAT_P_COUNT; cc++) {
+          sums[cc] = coopMatMulAdd(matK[cc], matQ[dd], sums[cc]);
+        }
+      }
+
+      {
+        [[unroll]] for (uint kk = 0; kk < M_COUNT; kk++) {
+          slm_pool_m[offsetSlmM + kk] = float(f16MaskState[kk]);
+        }
+      }
+
+      [[unroll]] for (uint cc = 0; cc < MAT_P_COUNT; cc++) {
+        coopMatStore(sums[cc], slm_pool_qp, 8 * cc + hhp * DP + vvp * TN * DP * QK_WARP_REDUCE, DP * QK_WARP_REDUCE, gl_CooperativeMatrixLayoutColumnMajor);
+      }
+    }
+
+    barrier();
+    [[unroll]] for (uint kk = 0; kk < V_COUNT; kk++) {
+      f16KState[kk] = vStateVec2[offsetBaseV + kk];
+    }
+
+    // p reduce sum and softmax
+    if (hhp == 0) {
+      float fp32M[DP];
+      float matP[DP * QK_WARP_REDUCE];
+      float localMax = historicMax;
+      float softmaxCompensation;
+
+      [[unroll]] for (uint cc = 0; cc < DP * QK_WARP_REDUCE; cc++) {
+        matP[cc] = slm_pool_qp[offsetLoadSlmP + cc];
+      }
+
+      // debug
+//      if (loop == 0 && localLinearId == 0 && h == 0 && v == 0) {
+//            [[unroll]] for (uint cc = 0; cc < DP * QK_WARP_REDUCE / 4; cc++) {
+//      attnOut[DP * QK_WARP_REDUCE / 4 * lane + cc] = vec4(matP[4 * cc], matP[4 * cc + 1], matP[4 * cc + 2], matP[4 * cc + 3]);
+//      }
+//      }
+
+      [[unroll]] for (uint kk = 0; kk < DP; kk++) {
+        fp32M[kk] = slm_pool_m[offsetSlmLoadMaskP + kk];
+      }
+
+      [[unroll]] for (uint cc = 0; cc < DP; cc++) {
+        matP[cc] = matP[cc] + matP[cc + DP];
+      }
+
+      [[unroll]] for (uint cc = 0; cc < DP; cc++) {
+        matP[cc] = matP[cc] + fp32M[cc];
+      }
+
+      [[unroll]] for (uint cc = 0; cc < DP; cc++) {
+        localMax = max(localMax, matP[cc]);
+      }
+
+      [[unroll]] for (uint cc = 0; cc < DP; cc++) {
+        matP[cc] = matP[cc] - localMax;
+      }
+
+      [[unroll]] for (uint cc = 0; cc < DP; cc++) {
+        matP[cc] = exp(matP[cc]);
+      }
+
+      softmaxCompensation = exp(historicMax - localMax);
+
+      softmaxSum = softmaxSum * softmaxCompensation;
+      [[unroll]] for (uint cc = 0; cc < DP; cc++) {
+        softmaxSum += matP[cc];
+      }
+
+      historicMax = localMax;
+      slm_historic_max[offsetSlmReduce] = historicMax;
+      slm_softmax_compensation[offsetSlmReduce] = softmaxCompensation;
+      slm_softmax_sum[offsetSlmReduce] = softmaxSum;
+
+      [[unroll]] for (uint cc = 0; cc < DP; cc++) {
+        slm_pool_pv[offsetSlmP + cc] = matP[cc];
+      }
+
+//      [[unroll]] for (uint cc = 0; cc < DP / 2; cc++) {
+//        slm_pool_pv_2[offsetSlmP2 + cc] = f16vec2(matP[2 * cc], matP[2 * cc + 1]);
+//      }
+    }
+
+    // gemm pv
+    {
+      float fp32V[32];
+      float matP[DP];
+
+      [[unroll]] for (uint cc = 0; cc < V_COUNT; cc++) {
+        fp32V[4 * cc + 0] = float(f16KState[cc].x);
+        fp32V[4 * cc + 1] = float(f16KState[cc].y);
+        fp32V[4 * cc + 2] = float(f16KState[cc].z);
+        fp32V[4 * cc + 3] = float(f16KState[cc].w);
+      }
+
+      [[unroll]] for (uint cc = 0; cc < V_COUNT * 4; cc++) {
+        slm_pool_v[offsetSlmV + cc] = fp32V[cc];
+      }
+
+      barrier();
+
+      [[unroll]] for (uint cc = 0; cc < DP; cc++) {
+        matP[cc] = slm_pool_pv[offsetSlmP + cc];
+      }
+
+      float softmaxCompensation = slm_softmax_compensation[offsetSlmReduce];
+      [[unroll]] for (uint cc = 0; cc < WARP_DIM; cc++) {
+        fp32Out[cc] = fp32Out[cc] * softmaxCompensation;
+      }
+
+      [[unroll]] for (uint pk = 0; pk < DP / TN; pk++) {
+        [[unroll]] for (uint hc = 0; hc < WARP_DIM / 32; hc++) {
+          [[unroll]] for (uint kk = 0; kk < 32; kk++) {
+            fp32V[kk] = slm_pool_v[offsetSlmLoadV + kk + 32 * hc + TN * HEAD_DIM * pk];
+          }
+
+          [[unroll]] for (uint kk = 0; kk < TN; kk++) {
+            [[unroll]] for (uint cc = 0; cc < 32; cc++) {
+              fp32Out[cc + 32 * hc] = fma(matP[kk + TN * pk], subgroupBroadcast(fp32V[cc], kk), fp32Out[cc + 32 * hc]);
+            }
+          }
+        }
+      }
+    }
+
+    offsetBaseK = offsetBaseK + DP * kvDim / 4;
+    offsetBaseK = min(offsetBaseK, kvBoundary);
+    offsetBaseV = offsetBaseV + DP * kvDim / 4;
+    offsetBaseV = min(offsetBaseV, kvBoundary);
+    offsetBaseMask += DP;
+  }
+
+  float softmaxMul;
+  softmaxSum = slm_softmax_sum[offsetSlmReduce];
+
+  if (0x1 == (p.flag & 0x1)) {
+    historicMax = slm_historic_max[offsetSlmReduce];
+    float sinkCompensation = historicMax - fp32SinkCoeff;
+    sinkCompensation = exp(sinkCompensation);
+    float softmaxSumTemp = softmaxSum * sinkCompensation;
+    softmaxSum = softmaxSum + 1.0f / sinkCompensation;
+    softmaxSum = 1.0f / softmaxSum;
+    sinkCompensation = sinkCompensation / (1.0f + softmaxSumTemp);
+    softmaxMul = historicMax < fp32SinkCoeff ? sinkCompensation : softmaxSum;
+  }
+  else {
+    softmaxMul = 1.0f / softmaxSum;
+  }
+
+  [[unroll]] for (uint cc = 0; cc < WARP_DIM; cc++) {
+    fp32Out[cc] = fp32Out[cc] * softmaxMul;
+  }
+
+  uint offsetCoord = h * OUTPUT_PER_WORKGROUP + vvq * TN + lane;
+//  if (h > 0x7fff) {
+  [[unroll]] for (uint cc = 0; cc < WARP_DIM / 4; cc++) {
+    if (offsetCoord < p.activationLength) {
+      attnOut[offsetOut + cc] = vec4(fp32Out[4 * cc], fp32Out[4 * cc + 1], fp32Out[4 * cc + 2], fp32Out[4 * cc + 3]);
+    }
+  }
+//  }
+}

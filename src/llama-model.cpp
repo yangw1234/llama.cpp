@@ -8954,6 +8954,7 @@ llama_model_params llama_model_default_params() {
         /*.use_extra_bufts             =*/ true,
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
+        /*.requant                     =*/ -1,  // auto: on for qwen35/qwen35moe; gemma4 opt-in via 1
     };
 
     return result;

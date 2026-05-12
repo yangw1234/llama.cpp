@@ -318,6 +318,7 @@ extern "C" {
         bool use_extra_bufts; // use extra buffer types (used for weight repacking)
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
+        int8_t requant;       // load-time requant of always-on tensors to Q4_K. -1 = auto (on for qwen35/qwen35moe; gemma4 opt-in via 1), 0 = off, 1 = on. Forces no-mmap when active.
     };
 
     struct llama_sampler_seq_config {

@@ -8158,6 +8158,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // gemma-4-26B-A4B fusion correctness (n_expert=128, n_used=8, m=2816, k=704)
+    for (int bs : {1, 4, 32}) {
+        for (ggml_type type_a : {GGML_TYPE_Q5_1, GGML_TYPE_Q4_K}) {
+            for (ggml_type type_b : {GGML_TYPE_F32}) {
+                test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, type_b, 128, 8, false, 2816, bs, 704, 1));
+            }
+        }
+    }
+
     for (ggml_type type_a : base_types) {
         for (ggml_type type_b : {GGML_TYPE_F32, GGML_TYPE_F16}) {
             for (int n : {1, 16}) {
@@ -8819,6 +8828,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+
+    // gemma-4-26B-A4B (q5_1 MoE: m=2816, k=704, n_expert=128, n_used=8)
+    for (int bs : {1, 4, 8, 32, 64, 128, 256, 512}) {
+        for (ggml_type type_a : {GGML_TYPE_Q5_1, GGML_TYPE_Q4_K}) {
+            for (ggml_type type_b : {GGML_TYPE_F32}) {
+                test_cases.emplace_back(new test_mul_mat_id(type_a, type_b, 128, 8, false, 2816, bs, 704));
+                test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, type_b, 128, 8, false, 2816, bs, 704, 1));
+            }
+        }
+    }
 
     // gpt-oss-20b
     for (int bs : {1, 4, 8, 512}) {

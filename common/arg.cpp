@@ -23,6 +23,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <cinttypes>
 #include <climits>
 #include <cstdarg>
@@ -2279,6 +2280,23 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             parse_tensor_buffer_overrides(value, params.tensor_buft_overrides);
         }
     ).set_env("LLAMA_ARG_OVERRIDE_TENSOR"));
+    add_opt(common_arg(
+        {"--requant"}, "MODE",
+        "load-time requantize always-on tensors to Q4_K (qwen35/qwen35moe: attention/shared-expert/SSM-out; gemma4: attention/per-layer FFN). "
+        "MODE in {auto, on, off}. Default: auto (on for qwen35/qwen35moe; gemma4 must opt in with --requant on). "
+        "When active, mmap is disabled automatically.",
+        [](common_params & params, const std::string & value) {
+            if (value == "on" || value == "1" || value == "true") {
+                params.requant = 1;
+            } else if (value == "off" || value == "0" || value == "false") {
+                params.requant = 0;
+            } else if (value == "auto" || value == "-1") {
+                params.requant = -1;
+            } else {
+                throw std::invalid_argument("invalid --requant value: '" + value + "' (expected auto|on|off)");
+            }
+        }
+    ).set_env("LLAMA_ARG_REQUANT"));
     add_opt(common_arg(
         {"-otd", "--override-tensor-draft"}, "<tensor name pattern>=<buffer type>,...",
         "override tensor buffer type for draft model", [](common_params & params, const std::string & value) {
