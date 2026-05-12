@@ -2,18 +2,6 @@ name: Release (superclaw, win-vulkan-x64 only)
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - b8698_opt
-    paths:
-      - '.github/workflows/release_superclaw.yml'
-      - '**/CMakeLists.txt'
-      - '**/*.h'
-      - '**/*.hpp'
-      - '**/*.c'
-      - '**/*.cpp'
-      - '**/*.comp'
-      - '**/*.glsl'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
