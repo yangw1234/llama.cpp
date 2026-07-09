@@ -11,12 +11,22 @@
 // 4-byte loads for Q4_1 blocks (20 bytes)
 void block_a_to_shmem(const uint buf_ib, const uint ib, const uint iqs) {
 #ifdef DATA_A_Q4_0
+#ifdef Q4_0_SOA
+    // SoA layout: qs[] region and scales[] region live in separate buffers/ranges.
+    // Each Q4_0 block has 16 bytes of quants = 4 uint32s, laid out contiguously in data_a_wq32.
+    buf_a[buf_ib].qs[iqs] = data_a_wq32[ib * 4 + iqs];
+
+    if (iqs == 0) {
+        buf_a[buf_ib].dm = FLOAT_TYPE(data_a_ws[ib]);
+    }
+#else
     buf_a[buf_ib].qs[iqs] = pack32(u16vec2(data_a_packed16[ib].qs[iqs * 2],
                                            data_a_packed16[ib].qs[iqs * 2 + 1]));
 
     if (iqs == 0) {
         buf_a[buf_ib].dm = FLOAT_TYPE(data_a_packed16[ib].d);
     }
+#endif
 #else // DATA_A_Q4_1
     buf_a[buf_ib].qs[iqs] = data_a_packed32[ib].qs[iqs];
 

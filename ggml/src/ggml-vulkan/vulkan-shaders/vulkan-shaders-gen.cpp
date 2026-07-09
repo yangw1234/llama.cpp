@@ -581,6 +581,12 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
         if (!coopmat2) {
             string_to_spv(shader_name + "_" + tname + "_f32",         source_name, merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"LOAD_VEC_A", load_vec_a_unaligned},                           {"B_TYPE", "float"},            {"D_TYPE", "float"}}), fp16, coopmat, coopmat2, f16acc);
             string_to_spv(shader_name + "_" + tname + "_f32_aligned", source_name, merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"LOAD_VEC_A", load_vec_a},           {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f32}, {"D_TYPE", "float"}, {"ALIGNED", "1"}}), fp16, coopmat, coopmat2, f16acc);
+
+            // SoA q4_0 variants: reuse mul_mm.comp with Q4_0_SOA defined, scalar or coopmat1 (non-MoE, non-coopmat2).
+            if (tname == "q4_0" && matmul_id_type == MatMulIdType::NONE && !coopmat2) {
+                string_to_spv(shader_name + "_" + tname + "_soa_f32",         source_name, merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"Q4_0_SOA", "1"}, {"LOAD_VEC_A", load_vec_a_unaligned},                           {"B_TYPE", "float"},            {"D_TYPE", "float"}}), fp16, coopmat, coopmat2, f16acc);
+                string_to_spv(shader_name + "_" + tname + "_soa_f32_aligned", source_name, merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"Q4_0_SOA", "1"}, {"LOAD_VEC_A", load_vec_a},           {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f32}, {"D_TYPE", "float"}, {"ALIGNED", "1"}}), fp16, coopmat, coopmat2, f16acc);
+            }
         }
 
         if (tname != "f16" && tname != "f32") {
@@ -592,6 +598,13 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
         // Integer dot mmq performs better with f32 accumulators
         if (!f16acc && !coopmat && !coopmat2 && (is_legacy_quant(tname) || is_k_quant(tname) || tname == "mxfp4")) {
             string_to_spv(shader_name + "_" + tname + "_q8_1", "mul_mmq.comp", merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"D_TYPE", "float"},}), fp16, coopmat, coopmat2, f16acc);
+        }
+
+        // SoA q4_0 MMQ variant: reads WQ u32 + WS fp16 from separate bindings.
+        // mul_mmq.comp has no coopmat code path, but we still emit a _cm1 SPV so the
+        // coopmat branch of the dispatcher can load it alongside the MM-SoA pipeline.
+        if (!f16acc && !coopmat2 && tname == "q4_0" && matmul_id_type == MatMulIdType::NONE) {
+            string_to_spv(shader_name + "_" + tname + "_soa_q8_1", "mul_mmq.comp", merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"Q4_0_SOA", "1"}, {"D_TYPE", "float"},}), fp16, coopmat, coopmat2, f16acc);
         }
 #endif
     }
@@ -731,6 +744,19 @@ void process_shaders() {
             string_to_spv("get_rows_" + tname, shader, merge_maps(base_dict, {{"TEMP_TYPE", "FLOAT_TYPE"}, {data_a_key, "1"}, {"B_TYPE", "int"}, {"D_TYPE", "float16_t"}}));
         }
         string_to_spv("get_rows_" + tname + "_f32", shader, merge_maps(base_dict, {{"TEMP_TYPE", "FLOAT_TYPE"}, {data_a_key, "1"}, {"B_TYPE", "int"}, {"D_TYPE", "float"}}));
+    }
+
+    // Stock-algorithm SoA variant: reuses mul_mat_vec.comp, swaps AoS reads for SoA via Q4_0_SOA.
+    // Bindings: 0=WQ (qs bytes, u16 view), 1=B, 2=D, 3=Fuse0, 4=Fuse1, 5=WS fp16.
+    {
+        std::map<std::string, std::string> soa_base = { {"DATA_A_Q4_0", "1"}, {"Q4_0_SOA", "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"} };
+        string_to_spv("mul_mat_vec_q4_0_soa_stock_f32_f32",                  "mul_mat_vec.comp", merge_maps(soa_base, {{"B_TYPE", "float"},   {"B_TYPEV2", "vec2"},   {"B_TYPEV4", "vec4"}}));
+        string_to_spv("mul_mat_vec_q4_0_soa_stock_f32_f32_subgroup",         "mul_mat_vec.comp", merge_maps(soa_base, {{"B_TYPE", "float"},   {"B_TYPEV2", "vec2"},   {"B_TYPEV4", "vec4"},   {"USE_SUBGROUP_ADD", "1"}}));
+        string_to_spv("mul_mat_vec_q4_0_soa_stock_f32_f32_subgroup_no_shmem","mul_mat_vec.comp", merge_maps(soa_base, {{"B_TYPE", "float"},   {"B_TYPEV2", "vec2"},   {"B_TYPEV4", "vec4"},   {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
+
+        std::map<std::string, std::string> soa64_base = { {"DATA_A_Q4_0", "1"}, {"Q4_0_SOA", "1"}, {"Q4_0_SOA_K64", "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"} };
+        string_to_spv("mul_mat_vec_q4_0_soa_stock_k64_f32_f32_subgroup",         "mul_mat_vec.comp", merge_maps(soa64_base, {{"B_TYPE", "float"},   {"B_TYPEV2", "vec2"},   {"B_TYPEV4", "vec4"},   {"USE_SUBGROUP_ADD", "1"}}));
+        string_to_spv("mul_mat_vec_q4_0_soa_stock_k64_f32_f32_subgroup_no_shmem","mul_mat_vec.comp", merge_maps(soa64_base, {{"B_TYPE", "float"},   {"B_TYPEV2", "vec2"},   {"B_TYPEV4", "vec4"},   {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
     }
 
     string_to_spv("get_rows_i32", "get_rows.comp", {{"TEMP_TYPE", "uint"}, {"A_TYPE", "uint"}, {"B_TYPE", "int"}, {"D_TYPE", "uint"}});

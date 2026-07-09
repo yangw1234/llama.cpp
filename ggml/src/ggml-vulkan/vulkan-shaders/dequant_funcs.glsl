@@ -22,7 +22,24 @@ vec2 dequantize(uint ib, uint iqs, uint a_offset) {
 }
 #endif
 
-#if defined(DATA_A_Q4_0)
+#if defined(DATA_A_Q4_0) && defined(Q4_0_SOA)
+// SoA: WQ region holds qs[] bytes only (d/scales are in a separate buffer).
+// Each block = 16 bytes = 4 u32. Callers pass ib = linear block index.
+// Read via u32 view (Intel iGPUs penalize u16 global loads).
+vec2 dequantize(uint ib, uint iqs, uint a_offset) {
+    const uint w32 = data_a_wq32[(a_offset + ib) * 4u + (iqs / 4u)];
+    const uint shift = (iqs & 3u) * 8u;
+    const uint byte = (w32 >> shift) & 0xFFu;
+    return (vec2(byte & 0xFu, byte >> 4) - 8.0f);
+}
+vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
+    // Read 1 u32 (covers 2 u16 = 4 bytes = 8 nibbles); take the u16 half addressed by iqs/2.
+    const uint w32 = data_a_wq32[(a_offset + ib) * 4u + (iqs / 4u)];
+    const uint shift = ((iqs / 2u) & 1u) * 16u;
+    const uint vui = (w32 >> shift) & 0xFFFFu;
+    return (vec4(vui & 0xF, (vui >> 4) & 0xF, (vui >> 8) & 0xF, vui >> 12) - 8.0f);
+}
+#elif defined(DATA_A_Q4_0)
 vec2 dequantize(uint ib, uint iqs, uint a_offset) {
     const uint vui = uint(data_a[a_offset + ib].qs[iqs]);
     return (vec2(vui & 0xF, vui >> 4) - 8.0f);
@@ -484,7 +501,11 @@ vec2 get_dm(uint ib, uint a_offset) {
 }
 #endif
 
-#if defined(DATA_A_Q4_0) || defined(DATA_A_Q5_0) || defined(DATA_A_Q8_0) || defined(DATA_A_IQ1_S) || defined(DATA_A_IQ2_XXS) || defined(DATA_A_IQ2_XS) || defined(DATA_A_IQ2_S) || defined(DATA_A_IQ3_XXS) || defined(DATA_A_IQ3_S) || defined(DATA_A_IQ4_XS) || defined(DATA_A_IQ4_NL)
+#if defined(DATA_A_Q4_0) && defined(Q4_0_SOA)
+vec2 get_dm(uint ib, uint a_offset) {
+    return vec2(float(data_a_ws[a_offset + ib]), 0);
+}
+#elif defined(DATA_A_Q4_0) || defined(DATA_A_Q5_0) || defined(DATA_A_Q8_0) || defined(DATA_A_IQ1_S) || defined(DATA_A_IQ2_XXS) || defined(DATA_A_IQ2_XS) || defined(DATA_A_IQ2_S) || defined(DATA_A_IQ3_XXS) || defined(DATA_A_IQ3_S) || defined(DATA_A_IQ4_XS) || defined(DATA_A_IQ4_NL)
 vec2 get_dm(uint ib, uint a_offset) {
     return vec2(float(data_a[a_offset + ib].d), 0);
 }
